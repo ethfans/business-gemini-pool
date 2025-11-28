@@ -672,6 +672,7 @@
                             <tr>
                                 <th>序号</th>
                                 <th>Team ID</th>
+                                <th>csesidx</th>
                                 <th>User Agent</th>
                                 <th>状态</th>
                                 <th>操作</th>
@@ -889,6 +890,41 @@
             <div class="modal-footer">
                 <button class="btn btn-outline" onclick="closeModal('editAccountModal')">取消</button>
                 <button class="btn btn-primary" onclick="updateAccount()">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 刷新Cookie模态框 -->
+    <div class="modal" id="refreshCookieModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>刷新账号Cookie</h3>
+                <button class="modal-close" onclick="closeModal('refreshCookieModal')" title="关闭">&times;</button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="refreshAccountId">
+                <p class="text-muted" style="margin-bottom: 16px;">请输入新的Cookie值来刷新账号认证信息。刷新后将清除JWT缓存。</p>
+                <div class="form-group">
+                    <label class="form-label" for="refreshSecureCses">Cookie中的__Secure-C_SES <span style="color: var(--danger);">*</span></label>
+                    <textarea class="form-textarea" id="refreshSecureCses" placeholder="输入新的__Secure-C_SES值" rows="3"></textarea>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="refreshHostCoses">Cookie中的__Host-C_OSES <span style="color: var(--danger);">*</span></label>
+                    <textarea class="form-textarea" id="refreshHostCoses" placeholder="输入新的__Host-C_OSES值" rows="3"></textarea>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="refreshCsesidx">CSESIDX (可选)</label>
+                    <input type="text" class="form-input" id="refreshCsesidx" placeholder="输入CSESIDX值">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">从JSON粘贴 (可选)</label>
+                    <textarea class="form-textarea" id="refreshCookieJson" placeholder="粘贴Cookie JSON数据" rows="3"></textarea>
+                    <button class="btn btn-outline" style="margin-top: 8px;" onclick="pasteRefreshCookieJson()">📋 粘贴并解析</button>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" onclick="closeModal('refreshCookieModal')">取消</button>
+                <button class="btn btn-primary" onclick="refreshAccountCookie()">刷新Cookie</button>
             </div>
         </div>
     </div>
@@ -1179,7 +1215,7 @@
             if (!tbody) return;
 
             if (accountsData.length === 0) {
-                tbody.innerHTML = `<tr><td colspan="5" class="empty-state">
+                tbody.innerHTML = `<tr><td colspan="6" class="empty-state">
                     <div class="empty-state-icon"><svg class="icon"><use xlink:href="#icon-users"></use></svg></div>
                     <h3>暂无账号</h3><p>点击 "添加账号" 按钮来创建一个。</p>
                 </td></tr>`;
@@ -1190,6 +1226,7 @@
                 <tr>
                     <td>${index + 1}</td>
                     <td><code>${acc.team_id || '-'}</code></td>
+                    <td><code>${acc.csesidx || '-'}</code></td>
                     <td title="${acc.user_agent}">${acc.user_agent ? acc.user_agent.substring(0, 30) + '...' : '-'}</td>
                     <td>
                         <span class="badge ${acc.available ? 'badge-success' : 'badge-danger'}">${acc.available ? '可用' : '不可用'}</span>
@@ -1198,6 +1235,7 @@
                     <td style="white-space: nowrap;">
                         <button class="btn btn-sm ${acc.enabled !== false ? 'btn-warning' : 'btn-success'} btn-icon" onclick="toggleAccount(${acc.id})" title="${acc.enabled !== false ? '停用' : '启用'}"><svg class="icon" style="width:16px; height:16px;"><use xlink:href="#icon-${acc.enabled !== false ? 'pause' : 'play'}"></use></svg></button>
                         <button class="btn btn-sm btn-outline btn-icon" onclick="testAccount(${acc.id})" title="测试连接"><svg class="icon" style="width:16px; height:16px;"><use xlink:href="#icon-zap"></use></svg></button>
+                        <button class="btn btn-sm btn-outline btn-icon" onclick="showRefreshCookieModal(${acc.id})" title="刷新Cookie"><svg class="icon" style="width:16px; height:16px;"><use xlink:href="#icon-refresh"></use></svg></button>
                         <button class="btn btn-sm btn-outline btn-icon" onclick="showEditAccountModal(${acc.id})" title="编辑"><svg class="icon" style="width:16px; height:16px;"><use xlink:href="#icon-settings"></use></svg></button>
                         <button class="btn btn-sm btn-danger btn-icon" onclick="deleteAccount(${acc.id})" title="删除"><svg class="icon" style="width:16px; height:16px;"><use xlink:href="#icon-x"></use></svg></button>
                     </td>
@@ -1390,6 +1428,106 @@
             }
         }
 
+        /**
+         * 显示刷新Cookie的模态框
+         * @param {number} id - 账号ID
+         */
+        function showRefreshCookieModal(id) {
+            const acc = accountsData.find(a => a.id === id);
+            if (!acc) {
+                showToast('账号不存在', 'error');
+                return;
+            }
+            
+            document.getElementById('refreshAccountId').value = id;
+            document.getElementById('refreshSecureCses').value = '';
+            document.getElementById('refreshHostCoses').value = '';
+            document.getElementById('refreshCsesidx').value = '';
+            document.getElementById('refreshCookieJson').value = '';
+            
+            openModal('refreshCookieModal');
+        }
+
+        /**
+         * 从JSON解析并填充刷新Cookie表单
+         * @param {string} text - JSON字符串
+         */
+        function parseRefreshCookieJson(text) {
+            const textarea = document.getElementById('refreshCookieJson');
+            const raw = (typeof text === 'string' ? text : textarea.value || '').trim();
+            if (!raw) {
+                showToast('请先粘贴Cookie JSON', 'warning');
+                return;
+            }
+            let acc;
+            try {
+                const parsed = JSON.parse(raw);
+                acc = Array.isArray(parsed) ? parsed[0] : parsed;
+                if (!acc || typeof acc !== 'object') throw new Error('格式不正确');
+            } catch (err) {
+                showToast('解析失败: ' + err.message, 'error');
+                return;
+            }
+
+            document.getElementById('refreshSecureCses').value = acc.secure_c_ses || '';
+            document.getElementById('refreshHostCoses').value = acc.host_c_oses || '';
+            document.getElementById('refreshCsesidx').value = acc.csesidx || '';
+            showToast('已填充Cookie信息', 'success');
+        }
+
+        /**
+         * 从剪贴板粘贴并解析刷新Cookie JSON
+         */
+        async function pasteRefreshCookieJson() {
+            try {
+                const text = await navigator.clipboard.readText();
+                document.getElementById('refreshCookieJson').value = text;
+                parseRefreshCookieJson(text);
+            } catch (e) {
+                showToast('无法读取剪贴板: ' + e.message, 'error');
+            }
+        }
+
+        /**
+         * 刷新账号Cookie
+         * 调用后端API更新账号的Cookie信息
+         */
+        async function refreshAccountCookie() {
+            const id = document.getElementById('refreshAccountId').value;
+            const secureCses = document.getElementById('refreshSecureCses').value.trim();
+            const hostCoses = document.getElementById('refreshHostCoses').value.trim();
+            const csesidx = document.getElementById('refreshCsesidx').value.trim();
+
+            // 验证必填字段
+            if (!secureCses || !hostCoses) {
+                showToast('secure_c_ses 和 host_c_oses 为必填项', 'warning');
+                return;
+            }
+
+            try {
+                const res = await apiFetch(`${API_BASE}/api/accounts/${id}/refresh-cookie`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        secure_c_ses: secureCses,
+                        host_c_oses: hostCoses,
+                        csesidx: csesidx || undefined
+                    })
+                });
+                const data = await res.json();
+                
+                if (res.ok && data.success) {
+                    showToast('Cookie刷新成功!', 'success');
+                    closeModal('refreshCookieModal');
+                    loadAccounts();
+                } else {
+                    throw new Error(data.error || data.detail || '未知错误');
+                }
+            } catch (e) {
+                showToast('Cookie刷新失败: ' + e.message, 'error');
+            }
+        }
+
         // --- 模型管理 (Models) ---
         async function loadModels() {
             try {
@@ -1541,8 +1679,8 @@
                 <tr>
                     <td><code>${token}</code></td>
                     <td style="white-space: nowrap;">
-                        <button class="btn btn-outline btn-sm" data-token="${token}" onclick="copyToken(this.dataset.token)">复制</button>
-                        <button class="btn btn-danger btn-sm" data-token="${token}" onclick="deleteToken(this.dataset.token)">删除</button>
+                        <button class="btn btn-outline btn-sm" data-token="${token}" onclick="copyToken(this.dataset.token)" title="复制Token">复制</button>
+                        <button class="btn btn-danger btn-sm" data-token="${token}" onclick="deleteToken(this.dataset.token)" title="删除Token">删除</button>
                     </td>
                 </tr>
             `).join('');

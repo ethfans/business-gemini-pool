@@ -646,6 +646,12 @@
                     <option value="gemini-enterprise">加载中...</option>
                 </select>
             </div>
+            <div class="model-selector">
+                <label for="accountSelect">指定账号:</label>
+                <select id="accountSelect">
+                    <option value="">自动轮询</option>
+                </select>
+            </div>
             <div class="mode-switch">
                 <span>非流式</span>
                 <label class="switch">
@@ -940,11 +946,37 @@
             return document.getElementById('modelSelect').value || 'gemini-enterprise';
         }
 
+        // ==================== 获取账号列表 ====================
+        async function loadAccountList() {
+            try {
+                const response = await fetch('/api/accounts');
+                if (!response.ok) throw new Error('获取账号列表失败');
+                const data = await response.json();
+                const accounts = data.accounts || [];
+                const select = document.getElementById('accountSelect');
+                select.innerHTML = '<option value="">自动轮询</option>';
+                accounts.filter(a => a.available).forEach(account => {
+                    const option = document.createElement('option');
+                    option.value = account.id;
+                    option.textContent = account.csesidx ? `账号${account.id} (${account.csesidx})` : `账号${account.id}`;
+                    select.appendChild(option);
+                });
+            } catch (error) {
+                console.error('加载账号列表失败:', error);
+            }
+        }
+
+        // ==================== 获取当前选中的账号 ====================
+        function getSelectedAccount() {
+            return document.getElementById('accountSelect').value || null;
+        }
+
         // ==================== 初始化 ====================
         window.onload = () => {
             console.log('页面加载完成，开始初始化...');
             loadSessions(); // 加载会话列表（会自动加载当前会话历史）
             loadModelList(); // 加载模型列表
+            loadAccountList(); // 加载账号列表
             if (chatHistory.length === 0) {
                 addMessage('ai', '你好！有什么我可以帮你的吗？');
             } else {
@@ -1048,7 +1080,8 @@
                 body: JSON.stringify({
                     model: getSelectedModel(),
                     messages: buildMessages(text),
-                    stream: true
+                    stream: true,
+                    account_id: getSelectedAccount()
                 }),
                 signal: abortController.signal
             });
@@ -1078,6 +1111,7 @@
                         try {
                             const parsed = JSON.parse(data);
                             const content = parsed.choices?.[0]?.delta?.content;
+                            const accountCsesidx = parsed.account_csesidx;
                             if (content) {
                                 // 收到第一个内容时，移除等待动画并创建AI消息气泡
                                 if (!aiMessageId) {
@@ -1086,6 +1120,10 @@
                                 }
                                 fullContent += content;
                                 updateAIBubble(aiMessageId, fullContent);
+                            }
+                            // 更新账号信息
+                            if (accountCsesidx && aiMessageId) {
+                                updateAIBubbleAccount(aiMessageId, accountCsesidx);
                             }
                         } catch (e) {
                             // 忽略解析错误
@@ -1121,7 +1159,8 @@
                 body: JSON.stringify({
                     model: getSelectedModel(),
                     messages: buildMessages(text),
-                    stream: false
+                    stream: false,
+                    account_id: getSelectedAccount()
                 }),
                 signal: abortController.signal
             });
@@ -1136,9 +1175,18 @@
 
             const data = await response.json();
             const content = data.choices?.[0]?.message?.content;
+            const accountCsesidx = data.account_csesidx;
 
             if (content) {
-                addMessage('ai', content);
+                // 使用createAIBubble以支持显示账号信息
+                const aiMessageId = createAIBubble();
+                updateAIBubble(aiMessageId, content);
+                if (accountCsesidx) {
+                    updateAIBubbleAccount(aiMessageId, accountCsesidx);
+                }
+                // 保存到历史记录
+                chatHistory.push({ role: 'ai', content: content, time: new Date().toISOString() });
+                saveChatHistory();
             } else {
                 addErrorMessage('未收到有效响应');
             }
@@ -1277,11 +1325,19 @@
             bubbleDiv.id = messageId + '-bubble';
             bubbleDiv.textContent = '';
             
+            // 账号信息显示区域
+            const accountDiv = document.createElement('div');
+            accountDiv.className = 'account-info';
+            accountDiv.id = messageId + '-account';
+            accountDiv.style.cssText = 'font-size: 11px; color: var(--text-muted); margin-top: 4px;';
+            accountDiv.textContent = '';
+            
             const timeDiv = document.createElement('div');
             timeDiv.className = 'timestamp';
             timeDiv.innerText = time;
             
             contentWrapper.appendChild(bubbleDiv);
+            contentWrapper.appendChild(accountDiv);
             contentWrapper.appendChild(timeDiv);
             
             rowDiv.appendChild(avatarDiv);
@@ -1291,6 +1347,14 @@
             container.scrollTop = container.scrollHeight;
 
             return messageId;
+        }
+
+        // 更新AI消息的账号信息
+        function updateAIBubbleAccount(messageId, accountCsesidx) {
+            const accountDiv = document.getElementById(messageId + '-account');
+            if (accountDiv && accountCsesidx) {
+                accountDiv.textContent = '账号: ' + accountCsesidx;
+            }
         }
 
         function updateAIBubble(messageId, content) {

@@ -1607,65 +1607,107 @@ def chat_completions():
         if not user_message and not input_images and not gemini_file_ids:
             return jsonify({"error": "No user message found"}), 400
         
-        # 轮训获取账号
-        available_accounts = account_manager.get_available_accounts()
-        if not available_accounts:
-            next_cd = account_manager.get_next_cooldown_info()
-            wait_msg = ""
-            if next_cd:
-                wait_msg = f"（最近冷却账号 {next_cd['index']}，约 {int(next_cd['cooldown_until']-time.time())} 秒后可重试）"
-            return jsonify({"error": f"没有可用的账号{wait_msg}"}), 429
-
-        max_retries = len(available_accounts)
-        last_error = None
-        chat_response = None
+        # 检查是否指定了特定账号
+        specified_account_id = data.get('account_id')
         
-        for retry_idx in range(max_retries):
-            account_idx = None
+        if specified_account_id is not None:
+            # 使用指定的账号
+            accounts = account_manager.accounts
+            if specified_account_id < 0 or specified_account_id >= len(accounts):
+                return jsonify({"error": f"无效的账号ID: {specified_account_id}"}), 400
+            account = accounts[specified_account_id]
+            if not account.get('enabled', True):
+                return jsonify({"error": f"账号 {specified_account_id} 已禁用"}), 400
+            # 检查是否在冷却中
+            cooldown_until = account.get('cooldown_until', 0)
+            if cooldown_until > time.time():
+                return jsonify({"error": f"账号 {specified_account_id} 正在冷却中，请稍后重试"}), 429
+            
+            max_retries = 1
+            last_error = None
+            chat_response = None
+            account_idx = specified_account_id
             try:
-                account_idx, account = account_manager.get_next_account()
                 session, jwt, team_id = ensure_session_for_account(account_idx, account)
                 proxy = account_manager.config.get("proxy")
                 
-                # 上传内联图片获取 fileId
                 for img in input_images:
                     uploaded_file_id = upload_inline_image_to_gemini(jwt, session, team_id, img, proxy)
                     if uploaded_file_id:
                         gemini_file_ids.append(uploaded_file_id)
                 
                 chat_response = stream_chat_with_images(jwt, session, user_message, proxy, team_id, gemini_file_ids)
-                break
-            except AccountRateLimitError as e:
+            except (AccountRateLimitError, AccountAuthError, AccountRequestError) as e:
                 last_error = e
-                if account_idx is not None:
-                    pt_wait = seconds_until_next_pt_midnight()
-                    cooldown_seconds = max(account_manager.rate_limit_cooldown, pt_wait)
-                    account_manager.mark_account_cooldown(account_idx, str(e), cooldown_seconds)
-                print(f"[聊天] 第{retry_idx+1}次尝试失败(限额): {e}")
-                continue
-            except AccountAuthError as e:
-                last_error = e
-                if account_idx is not None:
-                    account_manager.mark_account_cooldown(account_idx, str(e), account_manager.auth_error_cooldown)
-                print(f"[聊天] 第{retry_idx+1}次尝试失败(凭证): {e}")
-                continue
-            except AccountRequestError as e:
-                last_error = e
-                if account_idx is not None:
-                    account_manager.mark_account_cooldown(account_idx, str(e), account_manager.generic_error_cooldown)
-                print(f"[聊天] 第{retry_idx+1}次尝试失败(请求异常): {e}")
-                continue
+                account_manager.mark_account_cooldown(account_idx, str(e), account_manager.generic_error_cooldown)
             except Exception as e:
                 last_error = e
-                print(f"[聊天] 第{retry_idx+1}次尝试失败: {type(e).__name__}: {e}")
-                if account_idx is None:
+        else:
+            # 轮训获取账号
+            available_accounts = account_manager.get_available_accounts()
+            if not available_accounts:
+                next_cd = account_manager.get_next_cooldown_info()
+                wait_msg = ""
+                if next_cd:
+                    wait_msg = f"（最近冷却账号 {next_cd['index']}，约 {int(next_cd['cooldown_until']-time.time())} 秒后可重试）"
+                return jsonify({"error": f"没有可用的账号{wait_msg}"}), 429
+
+            max_retries = len(available_accounts)
+            last_error = None
+            chat_response = None
+            
+            for retry_idx in range(max_retries):
+                account_idx = None
+                try:
+                    account_idx, account = account_manager.get_next_account()
+                    session, jwt, team_id = ensure_session_for_account(account_idx, account)
+                    proxy = account_manager.config.get("proxy")
+                    
+                    # 上传内联图片获取 fileId
+                    for img in input_images:
+                        uploaded_file_id = upload_inline_image_to_gemini(jwt, session, team_id, img, proxy)
+                        if uploaded_file_id:
+                            gemini_file_ids.append(uploaded_file_id)
+                    
+                    chat_response = stream_chat_with_images(jwt, session, user_message, proxy, team_id, gemini_file_ids)
                     break
-                continue
+                except AccountRateLimitError as e:
+                    last_error = e
+                    if account_idx is not None:
+                        pt_wait = seconds_until_next_pt_midnight()
+                        cooldown_seconds = max(account_manager.rate_limit_cooldown, pt_wait)
+                        account_manager.mark_account_cooldown(account_idx, str(e), cooldown_seconds)
+                    print(f"[聊天] 第{retry_idx+1}次尝试失败(限额): {e}")
+                    continue
+                except AccountAuthError as e:
+                    last_error = e
+                    if account_idx is not None:
+                        account_manager.mark_account_cooldown(account_idx, str(e), account_manager.auth_error_cooldown)
+                    print(f"[聊天] 第{retry_idx+1}次尝试失败(凭证): {e}")
+                    continue
+                except AccountRequestError as e:
+                    last_error = e
+                    if account_idx is not None:
+                        account_manager.mark_account_cooldown(account_idx, str(e), account_manager.generic_error_cooldown)
+                    print(f"[聊天] 第{retry_idx+1}次尝试失败(请求异常): {e}")
+                    continue
+                except Exception as e:
+                    last_error = e
+                    print(f"[聊天] 第{retry_idx+1}次尝试失败: {type(e).__name__}: {e}")
+                    if account_idx is None:
+                        break
+                    continue
         
         if chat_response is None:
             error_message = last_error or "没有可用的账号"
             status_code = 429 if isinstance(last_error, (AccountRateLimitError, NoAvailableAccount)) else 500
             return jsonify({"error": f"所有账号请求失败: {error_message}"}), status_code
+
+        # 获取使用的账号csesidx
+        used_account_csesidx = None
+        if account_idx is not None and account_idx < len(account_manager.accounts):
+            used_account = account_manager.accounts[account_idx]
+            used_account_csesidx = used_account.get('csesidx', f'账号{account_idx}')
 
         # 构建响应内容（包含图片）
         response_content = build_openai_response_content(chat_response, request.host_url)
@@ -1679,6 +1721,7 @@ def chat_completions():
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
                     "model": "gemini-enterprise",
+                    "account_csesidx": used_account_csesidx,
                     "choices": [{
                         "index": 0,
                         "delta": {"content": response_content},
@@ -1710,6 +1753,7 @@ def chat_completions():
                 "object": "chat.completion",
                 "created": int(time.time()),
                 "model": "gemini-enterprise",
+                "account_csesidx": used_account_csesidx,
                 "choices": [{
                     "index": 0,
                     "message": {
@@ -1979,6 +2023,36 @@ def toggle_account(account_id):
     
     account_manager.save_config()
     return jsonify({"success": True, "available": not current})
+
+
+@app.route('/api/accounts/<int:account_id>/refresh-cookie', methods=['POST'])
+@require_admin
+def refresh_account_cookies(account_id):
+    """刷新账号的secure_c_ses、host_c_oses和csesidx"""
+    if account_id < 0 or account_id >= len(account_manager.accounts):
+        return jsonify({"error": "账号不存在"}), 404
+    
+    data = request.json
+    acc = account_manager.accounts[account_id]
+    
+    # 更新Cookie字段
+    if "secure_c_ses" in data:
+        acc["secure_c_ses"] = data["secure_c_ses"]
+    if "host_c_oses" in data:
+        acc["host_c_oses"] = data["host_c_oses"]
+    if "csesidx" in data and data["csesidx"]:
+        acc["csesidx"] = data["csesidx"]
+    
+    # 清除JWT缓存，强制重新获取
+    state = account_manager.account_states.get(account_id, {})
+    state["jwt"] = None
+    state["jwt_time"] = 0
+    account_manager.account_states[account_id] = state
+    
+    account_manager.config["accounts"] = account_manager.accounts
+    account_manager.save_config()
+    
+    return jsonify({"success": True, "message": "Cookie已刷新"})
 
 
 @app.route('/api/accounts/<int:account_id>/test', methods=['GET'])
