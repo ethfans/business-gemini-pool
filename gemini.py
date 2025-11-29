@@ -1210,17 +1210,25 @@ def stream_chat_with_images(jwt: str, sess_name: str, message: str,
 
                     try:
                         image_data = download_file_with_jwt(jwt, session_path, fid, proxy)
-                        filename = save_image_to_cache(image_data, mime, fname)
+                        filename = None
+                        local_path = None
                         b64_data = base64.b64encode(image_data).decode("utf-8")
+
+                        # 仅在 URL 模式下缓存到本地以便通过 /image/ 访问
+                        if not is_base64_output_mode():
+                            filename = save_image_to_cache(image_data, mime, fname)
+                            local_path = str(IMAGE_CACHE_DIR / filename)
+
                         img = ChatImage(
                             file_id=fid,
                             file_name=filename,
                             mime_type=mime,
-                            local_path=str(IMAGE_CACHE_DIR / filename),
+                            local_path=local_path,
                             base64_data=b64_data,
                         )
                         result.images.append(img)
-                        print(f"[图片] 已保存: {filename}")
+                        if filename:
+                            print(f"[图片] 已保存: {filename}")
                     except Exception as e:
                         print(f"[图片] 下载失败 (fileId={fid}): {e}")
             except Exception as e:
@@ -1243,17 +1251,25 @@ def parse_generated_image(gen_img: Dict, result: ChatResponse, proxy: Optional[s
     b64_data = image_data.get("bytesBase64Encoded")
     if b64_data:
         try:
-            decoded = base64.b64decode(b64_data)
             mime_type = image_data.get("mimeType", "image/png")
-            filename = save_image_to_cache(decoded, mime_type)
+            filename = None
+            local_path = None
+
+            # 仅在 URL 模式下落盘缓存
+            if not is_base64_output_mode():
+                decoded = base64.b64decode(b64_data)
+                filename = save_image_to_cache(decoded, mime_type)
+                local_path = str(IMAGE_CACHE_DIR / filename)
+
             img = ChatImage(
                 base64_data=b64_data,
                 mime_type=mime_type,
                 file_name=filename,
-                local_path=str(IMAGE_CACHE_DIR / filename)
+                local_path=local_path,
             )
             result.images.append(img)
-            print(f"[图片] 已保存: {filename}")
+            if filename:
+                print(f"[图片] 已保存: {filename}")
         except Exception as e:
             print(f"[图片] 解析base64失败: {e}")
 
@@ -1266,17 +1282,24 @@ def parse_image_from_content(content: Dict, result: ChatResponse, proxy: Optiona
         b64_data = inline_data.get("data")
         if b64_data:
             try:
-                decoded = base64.b64decode(b64_data)
                 mime_type = inline_data.get("mimeType", "image/png")
-                filename = save_image_to_cache(decoded, mime_type)
+                filename = None
+                local_path = None
+
+                if not is_base64_output_mode():
+                    decoded = base64.b64decode(b64_data)
+                    filename = save_image_to_cache(decoded, mime_type)
+                    local_path = str(IMAGE_CACHE_DIR / filename)
+
                 img = ChatImage(
                     base64_data=b64_data,
                     mime_type=mime_type,
                     file_name=filename,
-                    local_path=str(IMAGE_CACHE_DIR / filename)
+                    local_path=local_path,
                 )
                 result.images.append(img)
-                print(f"[图片] 已保存: {filename}")
+                if filename:
+                    print(f"[图片] 已保存: {filename}")
             except Exception as e:
                 print(f"[图片] 解析inlineData失败: {e}")
 
@@ -1292,17 +1315,24 @@ def parse_attachment(att: Dict, result: ChatResponse, proxy: Optional[str] = Non
     b64_data = att.get("data") or att.get("bytesBase64Encoded")
     if b64_data:
         try:
-            decoded = base64.b64decode(b64_data)
-            filename = att.get("name") or None
-            filename = save_image_to_cache(decoded, mime_type, filename)
+            filename = None
+            local_path = None
+
+            if not is_base64_output_mode():
+                decoded = base64.b64decode(b64_data)
+                filename = att.get("name") or None
+                filename = save_image_to_cache(decoded, mime_type, filename)
+                local_path = str(IMAGE_CACHE_DIR / filename)
+
             img = ChatImage(
                 base64_data=b64_data,
                 mime_type=mime_type,
                 file_name=filename,
-                local_path=str(IMAGE_CACHE_DIR / filename)
+                local_path=local_path,
             )
             result.images.append(img)
-            print(f"[图片] 已保存: {filename}")
+            if filename:
+                print(f"[图片] 已保存: {filename}")
         except Exception as e:
             print(f"[图片] 解析attachment失败: {e}")
 
@@ -1805,6 +1835,17 @@ def get_image_base_url(fallback_host_url: str) -> str:
     return fallback_host_url
 
 
+def is_base64_output_mode() -> bool:
+    try:
+        if account_manager.config:
+            mode = account_manager.config.get("image_output_mode") or "url"
+            if isinstance(mode, str) and mode.lower() == "base64":
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def build_openai_response_content(chat_response: ChatResponse, host_url: str) -> str:
     """构建OpenAI格式的响应内容
 
@@ -1818,29 +1859,22 @@ def build_openai_response_content(chat_response: ChatResponse, host_url: str) ->
         return result_text
 
     # 从配置读取图片输出模式，默认 url
-    image_mode = "url"
-    try:
-        if account_manager.config:
-            cfg_mode = account_manager.config.get("image_output_mode") or "url"
-            if isinstance(cfg_mode, str) and cfg_mode.lower() in ("url", "base64"):
-                image_mode = cfg_mode.lower()
-    except Exception:
-        pass
+    image_mode = "base64" if is_base64_output_mode() else "url"
 
     image_lines = []
 
     if image_mode == "base64":
-        # 优先使用已有的base64数据
+        # 优先使用已有的base64数据（使用 Markdown 图片语法，方便前端渲染）
         for img in chat_response.images:
             if img.base64_data:
                 mime = img.mime_type or "image/png"
-                image_lines.append(f"data:{mime};base64,{img.base64_data}")
+                image_lines.append(f"![image](data:{mime};base64,{img.base64_data})")
 
-        # 若部分图片没有base64数据，降级为URL形式
+        # 若部分图片没有base64数据，降级为URL形式，同样用 Markdown 图片语法
         base_url = get_image_base_url(host_url)
         for img in chat_response.images:
             if not img.base64_data and img.file_name:
-                image_lines.append(f"{base_url}image/{img.file_name}")
+                image_lines.append(f"![image]({base_url}image/{img.file_name})")
     else:
         # 传统URL模式
         base_url = get_image_base_url(host_url)
