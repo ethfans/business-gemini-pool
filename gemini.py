@@ -1890,6 +1890,202 @@ def build_openai_response_content(chat_response: ChatResponse, host_url: str) ->
     return result_text
 
 
+@app.route('/v1/images/generations', methods=['POST'])
+@require_api_auth
+def create_image():
+    """OpenAI 兼容的图片生成接口"""
+    try:
+        # 每次请求时清理过期图片
+        cleanup_expired_images()
+        
+        data = request.json or {}
+        prompt = data.get('prompt', '')
+        if not prompt:
+            return jsonify({"error": {"message": "prompt is required", "type": "invalid_request_error"}}), 400
+        
+        # OpenAI 兼容参数
+        n = data.get('n', 1)  # 生成图片数量，默认1
+        size = data.get('size', '1024x1024')  # 图片尺寸（提示用，实际由Gemini决定）
+        quality = data.get('quality', 'standard')  # 质量（提示用）
+        response_format = data.get('response_format', 'url')  # 响应格式：url 或 b64_json
+        model = data.get('model', 'dall-e-3')  # 模型名称（提示用）
+        
+        # 限制生成数量
+        if n < 1 or n > 10:
+            return jsonify({"error": {"message": "n must be between 1 and 10", "type": "invalid_request_error"}}), 400
+        
+        # 构建图片生成提示词
+        image_prompt = f"请生成图片：{prompt}"
+        if size:
+            image_prompt += f"，尺寸：{size}"
+        if quality == 'hd':
+            image_prompt += "，高质量"
+        
+        # 检查是否指定了特定账号
+        specified_account_id = data.get('account_id')
+        
+        if specified_account_id is not None:
+            # 使用指定的账号
+            accounts = account_manager.accounts
+            if specified_account_id < 0 or specified_account_id >= len(accounts):
+                return jsonify({"error": {"message": f"无效的账号ID: {specified_account_id}", "type": "invalid_request_error"}}), 400
+            account = accounts[specified_account_id]
+            if not account.get('enabled', True):
+                return jsonify({"error": {"message": f"账号 {specified_account_id} 已禁用", "type": "invalid_request_error"}}), 400
+            # 检查是否在冷却中
+            cooldown_until = account.get('cooldown_until', 0)
+            if cooldown_until > time.time():
+                return jsonify({"error": {"message": f"账号 {specified_account_id} 正在冷却中，请稍后重试", "type": "rate_limit_error"}}), 429
+            
+            account_idx = specified_account_id
+            all_images = []
+            last_error = None
+            try:
+                session, jwt, team_id = ensure_session_for_account(account_idx, account)
+                proxy = get_proxy()
+                
+                # 生成图片（可能需要多次调用以满足 n 参数）
+                for i in range(n):
+                    chat_response = stream_chat_with_images(jwt, session, image_prompt, proxy, team_id, [])
+                    all_images.extend(chat_response.images)
+                    if len(all_images) >= n:
+                        break
+                
+                # 只返回前 n 张图片
+                all_images = all_images[:n]
+                
+            except AccountRateLimitError as e:
+                last_error = e
+                pt_wait = seconds_until_next_pt_midnight()
+                cooldown_seconds = max(account_manager.rate_limit_cooldown, pt_wait)
+                account_manager.mark_account_cooldown(account_idx, str(e), cooldown_seconds)
+            except AccountAuthError as e:
+                last_error = e
+                account_manager.mark_account_cooldown(account_idx, str(e), account_manager.auth_error_cooldown)
+            except AccountRequestError as e:
+                last_error = e
+                account_manager.mark_account_cooldown(account_idx, str(e), account_manager.generic_error_cooldown)
+            except Exception as e:
+                last_error = e
+        else:
+            # 轮训获取账号
+            available_accounts = account_manager.get_available_accounts()
+            if not available_accounts:
+                next_cd = account_manager.get_next_cooldown_info()
+                wait_msg = ""
+                if next_cd:
+                    wait_msg = f"（最近冷却账号 {next_cd['index']}，约 {int(next_cd['cooldown_until']-time.time())} 秒后可重试）"
+                return jsonify({"error": {"message": f"没有可用的账号{wait_msg}", "type": "rate_limit_error"}}), 429
+
+            max_retries = len(available_accounts)
+            last_error = None
+            all_images = []
+            account_idx = None
+            
+            for retry_idx in range(max_retries):
+                try:
+                    account_idx, account = account_manager.get_next_account()
+                    session, jwt, team_id = ensure_session_for_account(account_idx, account)
+                    proxy = get_proxy()
+                    
+                    # 生成图片（可能需要多次调用以满足 n 参数）
+                    for i in range(n):
+                        chat_response = stream_chat_with_images(jwt, session, image_prompt, proxy, team_id, [])
+                        all_images.extend(chat_response.images)
+                        if len(all_images) >= n:
+                            break
+                    
+                    # 只返回前 n 张图片
+                    all_images = all_images[:n]
+                    break
+                    
+                except AccountRateLimitError as e:
+                    last_error = e
+                    if account_idx is not None:
+                        pt_wait = seconds_until_next_pt_midnight()
+                        cooldown_seconds = max(account_manager.rate_limit_cooldown, pt_wait)
+                        account_manager.mark_account_cooldown(account_idx, str(e), cooldown_seconds)
+                    print(f"[图片生成] 第{retry_idx+1}次尝试失败(限额): {e}")
+                    continue
+                except AccountAuthError as e:
+                    last_error = e
+                    if account_idx is not None:
+                        account_manager.mark_account_cooldown(account_idx, str(e), account_manager.auth_error_cooldown)
+                    print(f"[图片生成] 第{retry_idx+1}次尝试失败(凭证): {e}")
+                    continue
+                except AccountRequestError as e:
+                    last_error = e
+                    if account_idx is not None:
+                        account_manager.mark_account_cooldown(account_idx, str(e), account_manager.generic_error_cooldown)
+                    print(f"[图片生成] 第{retry_idx+1}次尝试失败(请求异常): {e}")
+                    continue
+                except Exception as e:
+                    last_error = e
+                    print(f"[图片生成] 第{retry_idx+1}次尝试失败: {type(e).__name__}: {e}")
+                    if account_idx is None:
+                        break
+                    continue
+        
+        if not all_images:
+            error_message = last_error or "图片生成失败"
+            status_code = 429 if isinstance(last_error, (AccountRateLimitError, NoAvailableAccount)) else 500
+            err_type = "rate_limit_error" if status_code == 429 else "api_error"
+            return jsonify({"error": {"message": error_message, "type": err_type}}), status_code
+        
+        # 构建 OpenAI 格式响应
+        base_url = get_image_base_url(request.host_url)
+        image_data_list = []
+        
+        for img in all_images:
+            image_item = {}
+            
+            if response_format == 'b64_json':
+                # 返回 base64 编码的图片
+                if img.base64_data:
+                    image_item["b64_json"] = img.base64_data
+                else:
+                    # 如果没有 base64 数据，尝试从文件读取
+                    if img.local_path and os.path.exists(img.local_path):
+                        with open(img.local_path, 'rb') as f:
+                            image_bytes = f.read()
+                            image_item["b64_json"] = base64.b64encode(image_bytes).decode('utf-8')
+                    else:
+                        # 降级为 URL
+                        if img.file_name:
+                            image_item["url"] = f"{base_url}image/{img.file_name}"
+            else:
+                # 返回 URL（默认）
+                if img.file_name:
+                    image_item["url"] = f"{base_url}image/{img.file_name}"
+                elif img.base64_data:
+                    # 如果没有文件名但有 base64，保存到缓存
+                    try:
+                        decoded = base64.b64decode(img.base64_data)
+                        filename = save_image_to_cache(decoded, img.mime_type or "image/png")
+                        image_item["url"] = f"{base_url}image/{filename}"
+                    except Exception:
+                        # 降级为 base64
+                        image_item["b64_json"] = img.base64_data
+            
+            # 可选：添加修订后的提示词
+            if prompt:
+                image_item["revised_prompt"] = prompt
+            
+            image_data_list.append(image_item)
+        
+        response = {
+            "created": int(time.time()),
+            "data": image_data_list
+        }
+        
+        return jsonify(response)
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": {"message": str(e), "type": "api_error"}}), 500
+
+
 # ==================== 图片服务接口 ====================
 
 @app.route('/image/<path:filename>')
